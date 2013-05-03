@@ -451,6 +451,30 @@ public class AudioManager {
         }
     }
 
+    /** @hide
+     *  Prevents adjusting the volume (no setting)
+     */
+    public void lockVolumeAdjust() {
+        IAudioService service = getService();
+        try {
+            service.lockVolumeAdjust();
+        } catch (RemoteException e) {
+            Log.e(TAG, "Dead object in lockVolumeAdjust", e);
+        }
+    }
+
+    /** @hide
+     *  Prevents adjusting the volume (no setting)
+     */
+    public void unlockVolumeAdjust() {
+        IAudioService service = getService();
+        try {
+            service.unlockVolumeAdjust();
+        } catch (RemoteException e) {
+            Log.e(TAG, "Dead object in unlockVolumeAdjust", e);
+        }
+    }
+
     /**
      * Adjusts the volume of a particular stream by one step in a direction.
      * <p>

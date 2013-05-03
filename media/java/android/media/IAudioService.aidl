@@ -26,6 +26,10 @@ import android.media.IRemoteControlDisplay;
  * {@hide}
  */
 interface IAudioService {
+
+    void lockVolumeAdjust();
+
+    void unlockVolumeAdjust();
     
     void adjustVolume(int direction, int flags);
 

@@ -53,6 +53,7 @@
 #include <audio_effects/effect_visualizer.h>
 #include <audio_effects/effect_ns.h>
 #include <audio_effects/effect_aec.h>
+#include <audio_utils/resampler.h>
 
 #include <cpustats/ThreadCpuUsage.h>
 #include <powermanager/PowerManager.h>
@@ -1367,7 +1368,7 @@ AudioFlinger::PlaybackThread::PlaybackThread(const sp<AudioFlinger>& audioFlinge
                                              int id,
                                              uint32_t device)
     :   ThreadBase(audioFlinger, id, device),
-        mMixBuffer(0), mSuspended(0), mBytesWritten(0), mOutput(output),
+        mMixBuffer(0), mSilenceBuffer(0), mSuspended(0), mBytesWritten(0), mOutput(output),
         mLastWriteTime(0), mNumWrites(0), mNumDelayedWrites(0), mInWrite(false)
 {
     snprintf(mName, kNameLength, "AudioOut_%d", id);
@@ -1387,6 +1388,7 @@ AudioFlinger::PlaybackThread::PlaybackThread(const sp<AudioFlinger>& audioFlinge
 AudioFlinger::PlaybackThread::~PlaybackThread()
 {
     delete [] mMixBuffer;
+    delete [] mSilenceBuffer;
 }
 
 status_t AudioFlinger::PlaybackThread::dump(int fd, const Vector<String16>& args)
@@ -1726,8 +1728,11 @@ void AudioFlinger::PlaybackThread::readOutputParameters()
     // FIXME - Current mixer implementation only supports stereo output: Always
     // Allocate a stereo buffer even if HW output is mono.
     if (mMixBuffer != NULL) delete[] mMixBuffer;
+    if (mSilenceBuffer != NULL) delete[] mSilenceBuffer;
     mMixBuffer = new int16_t[mFrameCount * 2];
+    mSilenceBuffer = new int16_t[mFrameCount * 2];
     memset(mMixBuffer, 0, mFrameCount * 2 * sizeof(int16_t));
+    memset(mSilenceBuffer, 0, mFrameCount * 2 * sizeof(int16_t));
 
     // force reconfiguration of effect chains and engines to take new buffer size and audio
     // parameters into account
@@ -2025,8 +2030,16 @@ bool AudioFlinger::MixerThread::threadLoop()
             mInWrite = true;
             mBytesWritten += mixBufferSize;
 
-            int bytesWritten = (int)mOutput->stream->write(mOutput->stream, mMixBuffer, mixBufferSize);
-            if (bytesWritten < 0) mBytesWritten -= mixBufferSize;
+            bool recording = false;
+            MixRecordThread* mixRecThread = mAudioFlinger->checkMixRecordThread_l();
+            recording = (mixRecThread != 0) && mixRecThread->isRecording();
+
+            int bytesWritten = (int)mOutput->stream->write(mOutput->stream, recording ? mSilenceBuffer : mMixBuffer, mixBufferSize);
+            if (bytesWritten < 0)
+                mBytesWritten -= mixBufferSize;
+            else if(recording)
+                mixRecThread->bytesSentToHardware(mMixBuffer, mixBufferSize);
+
             mNumWrites++;
             mInWrite = false;
             nsecs_t now = systemTime();
@@ -2829,8 +2842,17 @@ bool AudioFlinger::DirectOutputThread::threadLoop()
             mLastWriteTime = systemTime();
             mInWrite = true;
             mBytesWritten += mixBufferSize;
-            int bytesWritten = (int)mOutput->stream->write(mOutput->stream, mMixBuffer, mixBufferSize);
-            if (bytesWritten < 0) mBytesWritten -= mixBufferSize;
+
+            bool recording = false;
+            MixRecordThread* mixRecThread = mAudioFlinger->checkMixRecordThread_l();
+            recording = (mixRecThread != 0) && mixRecThread->isRecording();
+
+            int bytesWritten = (int)mOutput->stream->write(mOutput->stream,recording ? mSilenceBuffer : mMixBuffer, mixBufferSize);
+            if (bytesWritten < 0)
+                mBytesWritten -= mixBufferSize;
+            else if(recording)
+                mixRecThread->bytesSentToHardware(mMixBuffer, mixBufferSize);
+
             mNumWrites++;
             mInWrite = false;
             mStandby = false;
@@ -3782,6 +3804,122 @@ void AudioFlinger::RecordThread::RecordTrack::dump(char* buffer, size_t size)
 
 // ----------------------------------------------------------------------------
 
+// RecordTrack constructor must be called with AudioFlinger::mLock held
+AudioFlinger::MixRecordThread::RecordTrack::RecordTrack(
+            const wp<ThreadBase>& thread,
+            const sp<Client>& client,
+            uint32_t sampleRate,
+            uint32_t format,
+            uint32_t channelMask,
+            int frameCount,
+            uint32_t flags,
+            int sessionId)
+    :   TrackBase(thread, client, sampleRate, format,
+                  channelMask, frameCount, flags, 0, sessionId),
+        mOverflow(false)
+{
+    if (mCblk != NULL) {
+       LOGV("RecordTrack (mix) constructor, size %d", (int)mBufferEnd - (int)mBuffer);
+       if (format == AUDIO_FORMAT_PCM_16_BIT) {
+           mCblk->frameSize = mChannelCount * sizeof(int16_t);
+       } else if (format == AUDIO_FORMAT_PCM_8_BIT) {
+           mCblk->frameSize = mChannelCount * sizeof(int8_t);
+       } else {
+           mCblk->frameSize = sizeof(int8_t);
+       }
+    }
+}
+
+AudioFlinger::MixRecordThread::RecordTrack::~RecordTrack()
+{
+    sp<ThreadBase> thread = mThread.promote();
+    if (thread != 0) {
+    //    AudioSystem::releaseInput(thread->id());
+    }
+}
+
+status_t AudioFlinger::MixRecordThread::RecordTrack::getNextBuffer(AudioBufferProvider::Buffer* buffer)
+{
+    audio_track_cblk_t* cblk = this->cblk();
+    uint32_t framesAvail;
+    uint32_t framesReq = buffer->frameCount;
+    LOGV("Mix::RecordTrack::getNextBuffer framesREQ (%d)", framesReq);
+
+     // Check if last stepServer failed, try to step now
+    if (mFlags & TrackBase::STEPSERVER_FAILED) {
+        if (!step()) {LOGV("STEPSERVER_FAILED");goto getNextBuffer_exit;}
+        LOGV("stepServer recovered");
+        mFlags &= ~TrackBase::STEPSERVER_FAILED;
+    }
+
+    framesAvail = cblk->framesAvailable_l();
+    LOGV("Mix::RecordTrack::getNextBuffer() framesAvailable = %d", framesAvail);
+    if (LIKELY(framesAvail)) {
+        uint32_t s = cblk->server;
+        uint32_t bufferEnd = cblk->serverBase + cblk->frameCount;
+
+        if (framesReq > framesAvail) {
+            framesReq = framesAvail;
+        }
+        if (s + framesReq > bufferEnd) {
+            framesReq = bufferEnd - s;
+        }
+
+        buffer->raw = getBuffer(s, framesReq);
+        if (buffer->raw == 0) goto getNextBuffer_exit;
+
+        buffer->frameCount = framesReq;
+        return NO_ERROR;
+    }
+
+getNextBuffer_exit:
+    buffer->raw = 0;
+    buffer->frameCount = 0;
+    LOGV("MixRecordThread::RecordTrack::getNextBuffer() NOT ENOUGH DATA");
+    return NOT_ENOUGH_DATA;
+}
+
+status_t AudioFlinger::MixRecordThread::RecordTrack::start()
+{
+    sp<ThreadBase> thread = mThread.promote();
+    if (thread != 0) {
+        MixRecordThread *recordThread = (MixRecordThread *)thread.get();
+        return recordThread->start(this);
+    } else {
+        return BAD_VALUE;
+    }
+}
+
+void AudioFlinger::MixRecordThread::RecordTrack::stop()
+{
+    sp<ThreadBase> thread = mThread.promote();
+    if (thread != 0) {
+        MixRecordThread *recordThread = (MixRecordThread *)thread.get();
+        recordThread->stop(this);
+        TrackBase::reset();
+        // Force overerrun condition to avoid false overrun callback until first data is
+        // read from buffer
+        android_atomic_or(CBLK_UNDERRUN_ON, &mCblk->flags);
+    }
+}
+
+void AudioFlinger::MixRecordThread::RecordTrack::dump(char* buffer, size_t size)
+{
+    snprintf(buffer, size, "   %05d %03u 0x%08x %05d   %04u %01d %05u  %08x %08x\n",
+            (mClient == NULL) ? getpid() : mClient->pid(),
+            mFormat,
+            mChannelMask,
+            mSessionId,
+            mFrameCount,
+            mState,
+            mCblk->sampleRate,
+            mCblk->server,
+            mCblk->user);
+}
+
+
+// ----------------------------------------------------------------------------
+
 AudioFlinger::PlaybackThread::OutputTrack::OutputTrack(
             const wp<ThreadBase>& thread,
             DuplicatingThread *sourceThread,
@@ -4200,6 +4338,88 @@ Exit:
     return recordHandle;
 }
 
+sp<IAudioRecord> AudioFlinger::openMixRecord(
+        pid_t pid,
+        uint32_t sampleRate,
+        uint32_t format,
+        uint32_t channelMask,
+        int frameCount,
+        uint32_t flags,
+        int *sessionId,
+        status_t *status)
+{
+    sp<MixRecordThread::RecordTrack> recordTrack;
+    sp<MixRecordHandle> recordHandle;
+    sp<Client> client;
+    wp<Client> wclient;
+    status_t lStatus;
+    MixRecordThread *thread;
+    size_t inFrameCount;
+    int lSessionId;
+
+    // check calling permissions
+    if (!recordingAllowed()) {
+        lStatus = PERMISSION_DENIED;
+        goto Exit;
+    }
+
+    // add client to list
+    { // scope for mLock
+        Mutex::Autolock _l(mLock);
+
+        thread = checkMixRecordThread_l();
+        if (thread == NULL) {
+            lStatus = BAD_VALUE;
+            goto Exit;
+        }
+
+        wclient = mClients.valueFor(pid);
+        if (wclient != NULL) {
+            client = wclient.promote();
+        } else {
+            client = new Client(this, pid);
+            mClients.add(pid, client);
+        }
+
+        // If no audio session id is provided, create one here
+        if (sessionId != NULL && *sessionId != AUDIO_SESSION_OUTPUT_MIX) {
+            lSessionId = *sessionId;
+        } else {
+            lSessionId = nextUniqueId();
+            if (sessionId != NULL) {
+                *sessionId = lSessionId;
+            }
+        }
+
+        // create new record track. The record track uses one track in mHardwareMixerThread by convention.
+        recordTrack = thread->createRecordTrack_l(client,
+                                                sampleRate,
+                                                format,
+                                                channelMask,
+                                                frameCount,
+                                                flags,
+                                                lSessionId,
+                                                &lStatus);
+    }
+    if (lStatus != NO_ERROR) {
+        // remove local strong reference to Client before deleting the RecordTrack so that the Client
+        // destructor is called by the TrackBase destructor with mLock held
+        client.clear();
+        recordTrack.clear();
+        goto Exit;
+    }
+
+    // return to handle to client
+    recordHandle = new MixRecordHandle(recordTrack);
+    lStatus = NO_ERROR;
+
+Exit:
+    if (status) {
+        *status = lStatus;
+    }
+    return recordHandle;
+}
+
 // ----------------------------------------------------------------------------
 
 AudioFlinger::RecordHandle::RecordHandle(const sp<AudioFlinger::RecordThread::RecordTrack>& recordTrack)
@@ -4227,6 +4447,37 @@ sp<IMemory> AudioFlinger::RecordHandle::getCblk() const {
 }
 
 status_t AudioFlinger::RecordHandle::onTransact(
+    uint32_t code, const Parcel& data, Parcel* reply, uint32_t flags)
+{
+    return BnAudioRecord::onTransact(code, data, reply, flags);
+}
+
+// ----------------------------------------------------------------------------
+AudioFlinger::MixRecordHandle::MixRecordHandle(const sp<AudioFlinger::MixRecordThread::RecordTrack>& recordTrack)
+    : BnAudioRecord(),
+    mRecordTrack(recordTrack)
+{
+}
+
+AudioFlinger::MixRecordHandle::~MixRecordHandle() {
+    stop();
+}
+
+status_t AudioFlinger::MixRecordHandle::start() {
+    LOGV("RecordHandle::start()");
+    return mRecordTrack->start();
+}
+
+void AudioFlinger::MixRecordHandle::stop() {
+    LOGV("RecordHandle::stop()");
+    mRecordTrack->stop();
+}
+
+sp<IMemory> AudioFlinger::MixRecordHandle::getCblk() const {
+    return mRecordTrack->getCblk();
+}
+
+status_t AudioFlinger::MixRecordHandle::onTransact(
     uint32_t code, const Parcel& data, Parcel* reply, uint32_t flags)
 {
     return BnAudioRecord::onTransact(code, data, reply, flags);
@@ -4895,6 +5146,783 @@ audio_stream_t* AudioFlinger::RecordThread::stream()
     return &mInput->stream->common;
 }
 
+// ----------------------------------------------------------------------------
+
+struct speex_resampler_itfe {
+    struct resampler_buffer_provider provider_itfe;
+    AudioFlinger::MixRecordThread* audio_itfe;
+};
+
+int speex_resampler_itfe_get_next_buffer(struct resampler_buffer_provider* provider, struct resampler_buffer* buffer) {
+    speex_resampler_itfe* upper_itfe = (speex_resampler_itfe*) provider;
+    upper_itfe->audio_itfe->getNextBuffer((AudioBufferProvider::Buffer*)buffer);
+    return 0;
+}
+
+void speex_resampler_itfe_releaese_buffer(struct resampler_buffer_provider* provider, struct resampler_buffer* buffer) {
+    speex_resampler_itfe* upper_itfe = (speex_resampler_itfe*) provider;
+    upper_itfe->audio_itfe->releaseBuffer((AudioBufferProvider::Buffer*)buffer);
+}
+
+AudioFlinger::MixRecordThread::MixRecordThread(const sp<AudioFlinger>& audioFlinger,
+                                         uint32_t sampleRate,
+                                         uint32_t channels,
+                                         int id,
+                                         uint32_t device) :
+    ThreadBase(audioFlinger, id, device),
+    mTrack(NULL), mResampler(0), mRsmpOutBuffer(0), mRsmpInBuffer(0), mOutputDupBuffer(0), 
+    mOutputDupReadIndex(0), mOutputDupWriteIndex(0), mOutputDupSize(0),  mOutputDupBytes(0)
+{
+    mType = ThreadBase::RECORD;
+
+    snprintf(mName, kNameLength, "AudioIn_%d", id);
+
+    mReqChannelCount = popcount(channels);
+    mReqSampleRate = sampleRate;
+    mRecording = false;
+    readInputParameters();
+}
+
+
+AudioFlinger::MixRecordThread::~MixRecordThread()
+{
+    delete[] mRsmpInBuffer;
+    delete[] mOutputDupBuffer;
+    if (mResampler != 0) {
+        release_resampler((resampler_itfe*)mResampler);
+        delete (struct speex_resampler_itfe*)mBufferProvider;
+        delete[] mRsmpOutBuffer;
+    }
+}
+
+void AudioFlinger::MixRecordThread::onFirstRef()
+{
+    run(mName, PRIORITY_URGENT_AUDIO);
+}
+
+status_t AudioFlinger::MixRecordThread::readyToRun()
+{
+    status_t status = initCheck();
+    LOGW_IF(status != NO_ERROR,"MixRecordThread %p could not initialize", this);
+    return status;
+}
+
+void AudioFlinger::MixRecordThread::bytesSentToHardware(void* data, size_t size)
+{
+    Mutex::Autolock _l(mOutputDupLock);
+
+    if(!mOutputDupBuffer || !mRecording)
+        return;
+    if(size > (mOutputDupBytes - mOutputDupSize)) {
+        LOGE("Buffer overflow");
+        int avail = (mOutputDupBytes - mOutputDupSize);
+        data = (void*)((uint8_t*)data + (size - avail));
+        size = avail;
+    }
+
+    if(size > 0) {
+        if((mOutputDupWriteIndex + size) >= mOutputDupBytes) {
+            int actual = mOutputDupBytes - mOutputDupWriteIndex;
+            if(actual > 0) {
+                memcpy(mOutputDupBuffer + mOutputDupWriteIndex, data, actual);
+                mOutputDupWriteIndex += actual;
+                size -= actual;
+                mOutputDupSize += actual;
+                data = (void*) ((uint8_t*) data + actual);
+            }
+            mOutputDupWriteIndex = 0;
+        }
+        if(size > 0) {
+            memcpy(mOutputDupBuffer + mOutputDupWriteIndex, data, size);
+            mOutputDupWriteIndex += size;
+            mOutputDupSize += size;
+        }
+    }
+}
+
+ssize_t AudioFlinger::MixRecordThread::readBytesSentToHardware(void* dst, size_t size)
+{
+
+    if(!mRecording)
+        return -1;
+    int retries = 6;
+    while(--retries && mOutputDupSize == 0) {
+        usleep(kRecordThreadSleepUs);
+    }
+    int read = 0;
+    {
+        Mutex::Autolock _l(mOutputDupLock);
+        if(size > mOutputDupSize) {
+            size = mOutputDupSize;
+        }
+        if(size > 0) {
+            if(mOutputDupReadIndex + size >= mOutputDupBytes) {
+                int actual = mOutputDupBytes - mOutputDupReadIndex;
+                if(actual > 0) {
+                    memcpy(dst, mOutputDupBuffer + mOutputDupReadIndex, actual);
+                    size -= actual;
+                    mOutputDupSize -= actual;
+                    dst = (void*) ((uint8_t*) dst + actual);
+                    read += actual;
+                }
+                mOutputDupReadIndex = 0;
+            }
+            if(size > 0) {
+                memcpy(dst, mOutputDupBuffer + mOutputDupReadIndex, size);
+                mOutputDupSize -= size;
+                mOutputDupReadIndex += size;
+                read += size;
+            }
+        }
+    }
+    return read ? read : -1;
+}
+
+bool AudioFlinger::MixRecordThread::threadLoop()
+{
+    AudioBufferProvider::Buffer buffer;
+    sp<RecordTrack> activeTrack;
+
+
+    nsecs_t lastWarning = 0;
+
+    acquireWakeLock();
+
+    // start recording
+    while (!exitPending()) {
+
+        processConfigEvents();
+
+        { // scope for mLock
+            Mutex::Autolock _l(mLock);
+
+            if (mActiveTrack == 0 && mConfigEvents.isEmpty()) {
+                if (!mStandby) {
+                    //mInput->stream->common.standby(&mInput->stream->common);
+                    mStandby = true;
+                }
+
+                if (exitPending()) break;
+
+                releaseWakeLock_l();
+                LOGW("MixRecordThread: loop stopping");
+                // go to sleep
+                mWaitWorkCV.wait(mLock);
+                LOGW("MixRecordThread: loop starting");
+                acquireWakeLock_l();
+                continue;
+            }
+            if (mActiveTrack != 0) {
+                if (mActiveTrack->mState == TrackBase::PAUSING) {
+                    if (!mStandby) {
+                        //mInput->stream->common.standby(&mInput->stream->common);
+                        mStandby = true;
+                    }
+                    mActiveTrack.clear();
+                    mStartStopCond.broadcast();
+                } else if (mActiveTrack->mState == TrackBase::RESUMING) {
+                    if (mReqChannelCount != mActiveTrack->channelCount()) {
+                        mActiveTrack.clear();
+                        mStartStopCond.broadcast();
+                    } else {
+                        // record start succeeds even if first read from audio 'output'
+                        // doesn't succeeds -> it could be in standby (i.e. no audio being played)
+                        if (mBytesRead >= 0) {
+                            mActiveTrack->mState = TrackBase::ACTIVE;
+                        } else {
+                            mActiveTrack.clear();
+                        }
+                        mStartStopCond.broadcast();
+                    }
+                    mStandby = false;
+                }
+            }
+        }
+
+        if (mActiveTrack != 0) {
+            if (mActiveTrack->mState != TrackBase::ACTIVE &&
+                mActiveTrack->mState != TrackBase::RESUMING) {
+
+                usleep(kRecordThreadSleepUs);
+                continue;
+            }
+
+            buffer.frameCount = mFrameCount;
+            if (LIKELY(mActiveTrack->getNextBuffer(&buffer) == NO_ERROR)) {
+                size_t framesOut = buffer.frameCount;
+                if (mResampler == 0) {
+                    // no resampling
+                    while (framesOut) {
+                        size_t framesIn = mFrameCount - mRsmpInIndex;
+                        if (framesIn) {
+                            int8_t *src = (int8_t *)mRsmpInBuffer + mRsmpInIndex * mFrameSize;
+                            int8_t *dst = buffer.i8 + (buffer.frameCount - framesOut) * mActiveTrack->mCblk->frameSize;
+                            if (framesIn > framesOut)
+                                framesIn = framesOut;
+                            mRsmpInIndex += framesIn;
+                            framesOut -= framesIn;
+                            if ((int)mChannelCount == mReqChannelCount ||
+                                mFormat != AUDIO_FORMAT_PCM_16_BIT) {
+                                memcpy(dst, src, framesIn * mFrameSize);
+                            } else {
+                                int16_t *src16 = (int16_t *)src;
+                                int16_t *dst16 = (int16_t *)dst;
+                                if (mChannelCount == 1) {
+                                    while (framesIn--) {
+                                        *dst16++ = *src16;
+                                        *dst16++ = *src16++;
+                                    }
+                                } else {
+                                    while (framesIn--) {
+                                        *dst16++ = (int16_t)(((int32_t)*src16 + (int32_t)*(src16 + 1)) >> 1);
+                                        src16 += 2;
+                                    }
+                                }
+                            }
+                        }
+
+                        if (framesOut && mFrameCount == mRsmpInIndex) {
+                            if (framesOut == mFrameCount &&
+                                ((int)mChannelCount == mReqChannelCount || mFormat != AUDIO_FORMAT_PCM_16_BIT)) {
+                                mBytesRead = readBytesSentToHardware(buffer.raw, mInputBytes);
+                                framesOut = 0;
+                            } else {
+                                mBytesRead = readBytesSentToHardware(mRsmpInBuffer, mInputBytes);
+                                mRsmpInIndex = 0;
+                            }
+
+                            if (mBytesRead < 0) {
+                                LOGE("Error reading mixer output");
+                                if (mActiveTrack->mState == TrackBase::ACTIVE) {
+                                    // Force input into standby so that it tries to
+                                    // recover at next read attempt
+                                    //mInput->stream->common.standby(&mInput->stream->common);
+                                    usleep(kRecordThreadSleepUs);
+                                }
+                                mRsmpInIndex = mFrameCount;
+                                framesOut = 0;
+                                buffer.frameCount = 0;
+                            }
+                        }
+                    }
+                } else {
+                    // resampling
+                    memset(mRsmpOutBuffer, 0, mFrameCount * 2 * sizeof(int32_t));
+                    // alter output frame count as if we were expecting stereo samples
+                    if (mChannelCount == 1 && mReqChannelCount == 1) {
+                        framesOut >>= 1;
+                    }
+                    ((resampler_itfe*)mResampler)->resample_from_provider((resampler_itfe*)mResampler, (int16_t*)mRsmpOutBuffer, &framesOut);
+
+                    memcpy(buffer.i16, mRsmpOutBuffer, framesOut * mFrameSize);
+                    LOGV_IF((buffer.frameCount != framesOut),"Resampler missing %d frames", buffer.frameCount - framesOut);
+                    buffer.frameCount = framesOut;
+                }
+                mActiveTrack->releaseBuffer(&buffer);
+                mActiveTrack->overflow();
+            }
+            // client isn't retrieving buffers fast enough
+            else {
+                if (!mActiveTrack->setOverflow()) {
+                    nsecs_t now = systemTime();
+                    if ((now - lastWarning) > kWarningThrottle) {
+                        LOGW("MixRecordThread: buffer overflow");
+                        lastWarning = now;
+                    }
+                }
+                // Release the processor for a while before asking for a new buffer.
+                // This will give the application more chance to read from the buffer and
+                // clear the overflow.
+                usleep(kRecordThreadSleepUs);
+            }
+        }
+        // enable changes in effect chain
+        //unlockEffectChains(effectChains);
+        //effectChains.clear();
+    }
+
+    if (!mStandby) {
+        //mInput->stream->common.standby(&mInput->stream->common);
+    }
+    mActiveTrack.clear();
+
+    mStartStopCond.broadcast();
+
+    releaseWakeLock();
+
+    LOGW("MixRecordThread %p exiting", this);
+    return false;
+}
+
+
+sp<AudioFlinger::MixRecordThread::RecordTrack>  AudioFlinger::MixRecordThread::createRecordTrack_l(
+        const sp<AudioFlinger::Client>& client,
+        uint32_t sampleRate,
+        int format,
+        int channelMask,
+        int frameCount,
+        uint32_t flags,
+        int sessionId,
+        status_t *status)
+{
+    sp<RecordTrack> track;
+    status_t lStatus;
+
+    lStatus = initCheck();
+    if (lStatus != NO_ERROR) {
+        LOGE("Audio driver not initialized.");
+        goto Exit;
+    }
+
+    { // scope for mLock
+        Mutex::Autolock _l(mLock);
+
+        track = new RecordTrack(this, client, sampleRate,
+                      format, channelMask, frameCount, flags, sessionId);
+
+        if (track->getCblk() == NULL) {
+            lStatus = NO_MEMORY;
+            LOGE("MixRecordThread::createRecordTrack NO MEMORY");
+            goto Exit;
+        }
+
+        mTrack = track.get();
+        LOGV("MixRecordThread::createRecordTrack TRACK COLLECTED (created successful)");
+        // disable AEC and NS if the device is a BT SCO headset supporting those pre processings
+        // bool suspend = audio_is_bluetooth_sco_device(
+        //         (audio_devices_t)(mDevice & AUDIO_DEVICE_IN_ALL)) && mAudioFlinger->btNrecIsOff();
+        // setEffectSuspended_l(FX_IID_AEC, suspend, sessionId);
+        // setEffectSuspended_l(FX_IID_NS, suspend, sessionId);
+    }
+    lStatus = NO_ERROR;
+
+Exit:
+    if (status) {
+        *status = lStatus;
+    }
+    return track;
+}
+
+status_t AudioFlinger::MixRecordThread::start(MixRecordThread::RecordTrack* recordTrack)
+{
+    LOGV("MixRecordThread::start");
+    sp <ThreadBase> strongMe = this;
+    status_t status = NO_ERROR;
+    {
+        AutoMutex lock(&mLock);
+        MixerThread *pbthread = mAudioFlinger->primaryMixerThread_l();
+        if (mActiveTrack != 0) {
+            if (recordTrack != mActiveTrack.get()) {
+                status = -EBUSY;
+            } else if (mActiveTrack->mState == TrackBase::PAUSING) {
+                mActiveTrack->mState = TrackBase::ACTIVE;
+            }
+            return status;
+        }
+
+        recordTrack->mState = TrackBase::IDLE;
+        mActiveTrack = recordTrack;
+        // mLock.unlock();
+        // status_t status = AudioSystem::startInput(mId);
+        // mLock.lock();
+        if (status != NO_ERROR) {
+            mActiveTrack.clear();
+            return status;
+        }
+        mRsmpInIndex = mFrameCount;
+        mBytesRead = 0;
+        if (mResampler != NULL) {
+            LOGV("Reset Resampler");
+            (*((resampler_itfe*)mResampler)->reset)(((resampler_itfe*)mResampler));
+        }
+        mActiveTrack->mState = TrackBase::RESUMING;
+        // signal thread to start
+        LOGV("Signal mixrecord thread");
+        mWaitWorkCV.signal();
+        // do not wait for mStartStopCond if exiting
+        if (mExiting) {
+            mActiveTrack.clear();
+            status = INVALID_OPERATION;
+            goto startError;
+        }
+        mStartStopCond.wait(mLock);
+        if (mActiveTrack == 0) {
+            LOGW("MixRecord failed to start");
+            status = BAD_VALUE;
+            goto startError;
+        }
+        AutoMutex dupLock(mOutputDupLock);
+
+        mOutputDupSize = 0;
+        mOutputDupReadIndex = 0;
+        mOutputDupWriteIndex = 0;
+
+        LOGW("MixRecord started");
+        mRecording = true;
+        return status;
+    }
+startError:
+    LOGW("MixRecord failed starting");
+    //AudioSystem::stopInput(mId);
+    return status;
+}
+
+void AudioFlinger::MixRecordThread::stop(MixRecordThread::RecordTrack* recordTrack) {
+    LOGV("MixRecordThread::stop");
+    sp <ThreadBase> strongMe = this;
+    {
+        AutoMutex lock(&mLock);
+        mRecording = false;
+        if (mActiveTrack != 0 && recordTrack == mActiveTrack.get()) {
+            mActiveTrack->mState = TrackBase::PAUSING;
+            // do not wait for mStartStopCond if exiting
+            if (mExiting) {
+                return;
+            }
+            LOGV("MixRecordThread::wait");
+            mStartStopCond.wait(mLock);
+            // if we have been restarted, recordTrack == mActiveTrack.get() here
+            if (mActiveTrack == 0 || recordTrack != mActiveTrack.get()) {
+                // mLock.unlock();
+                // AudioSystem::stopInput(mId);
+                // mLock.lock();
+                LOGW("MixRecord stopped");
+            }
+        }
+    }
+}
+
+status_t AudioFlinger::MixRecordThread::dump(int fd, const Vector<String16>& args)
+{
+    const size_t SIZE = 256;
+    char buffer[SIZE];
+    String8 result;
+    pid_t pid = 0;
+
+    snprintf(buffer, SIZE, "\nInput thread %p internals\n", this);
+    result.append(buffer);
+
+    if (mActiveTrack != 0) {
+        result.append("Active Track:\n");
+        result.append("   Clien Fmt Chn mask   Session Buf  S SRate  Serv     User\n");
+        mActiveTrack->dump(buffer, SIZE);
+        result.append(buffer);
+
+        snprintf(buffer, SIZE, "In index: %d\n", mRsmpInIndex);
+        result.append(buffer);
+        snprintf(buffer, SIZE, "In size: %d\n", mInputBytes);
+        result.append(buffer);
+        snprintf(buffer, SIZE, "Resampling: %d\n", (mResampler != 0));
+        result.append(buffer);
+        snprintf(buffer, SIZE, "Out channel count: %d\n", mReqChannelCount);
+        result.append(buffer);
+        snprintf(buffer, SIZE, "Out sample rate: %d\n", mReqSampleRate);
+        result.append(buffer);
+
+
+    } else {
+        result.append("No record client\n");
+    }
+    write(fd, result.string(), result.size());
+
+    dumpBase(fd, args);
+    dumpEffectChains(fd, args);
+
+    return NO_ERROR;
+}
+
+status_t AudioFlinger::MixRecordThread::getNextBuffer(AudioBufferProvider::Buffer* buffer)
+{
+    size_t framesReq = buffer->frameCount;
+    size_t framesReady = mFrameCount - mRsmpInIndex;
+    int channelCount;
+
+    if (framesReady == 0) {
+        mBytesRead = readBytesSentToHardware(mRsmpInBuffer, mInputBytes);
+        if (mBytesRead < 0) {
+            if (mActiveTrack->mState == TrackBase::ACTIVE) {
+                 // Force input into standby so that it tries to
+                 // recover at next read attempt
+                 usleep(kRecordThreadSleepUs);
+            }
+            buffer->raw = 0;
+            buffer->frameCount = 0;
+            return NOT_ENOUGH_DATA;
+        }
+        mRsmpInIndex = 0;
+        framesReady = mBytesRead / mFrameSize;
+    }
+
+    if (framesReq > framesReady) {
+        framesReq = framesReady;
+    }
+
+    if (mChannelCount == 1 && mReqChannelCount == 2) {
+        channelCount = 1;
+    } else {
+        channelCount = 2;
+    }
+    buffer->raw = mRsmpInBuffer + mRsmpInIndex * channelCount;
+
+    buffer->frameCount = framesReq;
+    return NO_ERROR;
+}
+
+void AudioFlinger::MixRecordThread::releaseBuffer(AudioBufferProvider::Buffer* buffer)
+{
+    mRsmpInIndex += buffer->frameCount;
+    buffer->frameCount = 0;
+}
+
+bool AudioFlinger::MixRecordThread::checkForNewParameters_l()
+{
+    bool reconfig = false;
+
+    while (!mNewParameters.isEmpty()) {
+        LOGV("+++ MixRecThread: Checking for new params");
+        status_t status = NO_ERROR;
+        String8 keyValuePair = mNewParameters[0];
+        AudioParameter param = AudioParameter(keyValuePair);
+        int value;
+        int reqFormat = mFormat;
+        int reqSamplingRate = mReqSampleRate;
+        int reqChannelCount = mReqChannelCount;
+
+        if (param.getInt(String8(AudioParameter::keySamplingRate), value) == NO_ERROR) {
+            reqSamplingRate = value;
+            reconfig = true;
+        }
+        if (param.getInt(String8(AudioParameter::keyFormat), value) == NO_ERROR) {
+            reqFormat = value;
+            reconfig = true;
+        }
+        if (param.getInt(String8(AudioParameter::keyChannels), value) == NO_ERROR) {
+            reqChannelCount = popcount(value);
+            reconfig = true;
+        }
+        if (param.getInt(String8(AudioParameter::keyFrameCount), value) == NO_ERROR) {
+            // do not accept frame count changes if tracks are open as the track buffer
+            // size depends on frame count and correct behavior would not be garantied
+            // if frame count is changed after track creation
+            if (mActiveTrack != 0) {
+                status = INVALID_OPERATION;
+            } else {
+                reconfig = true;
+            }
+        }
+        // if (param.getInt(String8(AudioParameter::keyRouting), value) == NO_ERROR) {
+        //     // forward device change to effects that have requested to be
+        //     // aware of attached audio device.
+        //     // for (size_t i = 0; i < mEffectChains.size(); i++) {
+        //     //     mEffectChains[i]->setDevice_l(value);
+        //     // }
+        //     // store input device and output device but do not forward output device to audio HAL.
+        //     // Note that status is ignored by the caller for output device
+        //     // (see AudioFlinger::setParameters()
+        //     if (value & AUDIO_DEVICE_OUT_ALL) {
+        //         mDevice &= (uint32_t)~(value & AUDIO_DEVICE_OUT_ALL);
+        //         status = BAD_VALUE;
+        //     } else {
+        //         mDevice &= (uint32_t)~(value & AUDIO_DEVICE_IN_ALL);
+        //         // disable AEC and NS if the device is a BT SCO headset supporting those pre processings
+        //         // if (mTrack != NULL) {
+        //         //     bool suspend = audio_is_bluetooth_sco_device(
+        //         //             (audio_devices_t)value) && mAudioFlinger->btNrecIsOff();
+        //         //     setEffectSuspended_l(FX_IID_AEC, suspend, mTrack->sessionId());
+        //         //     setEffectSuspended_l(FX_IID_NS, suspend, mTrack->sessionId());
+        //         // }
+        //     }
+        //     mDevice |= (uint32_t)value;
+        // }
+        if (status == NO_ERROR) {
+            //status = mInput->stream->common.set_parameters(&mInput->stream->common, keyValuePair.string());
+            if (status == INVALID_OPERATION) {
+               //mInput->stream->common.standby(&mInput->stream->common);
+               //status = mInput->stream->common.set_parameters(&mInput->stream->common, keyValuePair.string());
+            }
+            if (reconfig) {
+                // if (status == BAD_VALUE &&
+                //     reqFormat == mInput->stream->common.get_format(&mInput->stream->common) &&
+                //     reqFormat == AUDIO_FORMAT_PCM_16_BIT &&
+                //     ((int)mInput->stream->common.get_sample_rate(&mInput->stream->common) <= (2 * reqSamplingRate)) &&
+                //     (popcount(mInput->stream->common.get_channels(&mInput->stream->common)) < 3) &&
+                //     (reqChannelCount < 3)) {
+                //     status = NO_ERROR;
+                // }
+                if (status == NO_ERROR) {
+                    readInputParameters();
+                    sendConfigEvent_l(AudioSystem::INPUT_CONFIG_CHANGED);
+                }
+            }
+        }
+
+        mNewParameters.removeAt(0);
+
+        mParamStatus = status;
+        mParamCond.signal();
+        // wait for condition with time out in case the thread calling ThreadBase::setParameters()
+        // already timed out waiting for the status and will never signal the condition.
+        mWaitWorkCV.waitRelative(mLock, kSetParametersTimeout);
+    }
+    return reconfig;
+}
+
+String8 AudioFlinger::MixRecordThread::getParameters(const String8& keys)
+{
+    char *s;
+    Mutex::Autolock _l(mLock);
+    MixerThread *thread = mAudioFlinger->primaryMixerThread_l();
+    audio_stream_t* stream = thread->stream();
+    String8 out_s8 = String8();
+
+    if (initCheck() != NO_ERROR) {
+        return out_s8;
+    }
+
+    s = stream->get_parameters(stream, keys.string());
+    out_s8 = String8(s);
+    free(s);
+    return out_s8;
+}
+
+void AudioFlinger::MixRecordThread::audioConfigChanged_l(int event, int param) {
+    AudioSystem::OutputDescriptor desc;
+    void *param2 = 0;
+
+    switch (event) {
+    case AudioSystem::INPUT_OPENED:
+    case AudioSystem::INPUT_CONFIG_CHANGED:
+        desc.channels = mChannelMask;
+        desc.samplingRate = mSampleRate;
+        desc.format = mFormat;
+        desc.frameCount = mFrameCount;
+        desc.latency = 0;
+        param2 = &desc;
+        break;
+
+    case AudioSystem::INPUT_CLOSED:
+    default:
+        break;
+    }
+    mAudioFlinger->audioConfigChanged_l(event, mId, param2);
+}
+
+void AudioFlinger::MixRecordThread::readInputParameters()
+{
+    if (mRsmpInBuffer) delete[] mRsmpInBuffer;
+    if (mRsmpOutBuffer) delete[] mRsmpOutBuffer;
+    if (mResampler) release_resampler((resampler_itfe*)mResampler); //delete mResampler;
+    if (mOutputDupBuffer) delete[] mOutputDupBuffer;
+    mResampler = 0;
+
+    Mutex::Autolock _l(mLock);
+    MixerThread *thread = mAudioFlinger->primaryMixerThread_l();
+    AudioStreamOut *mOutput = thread->getOutput();
+
+    mSampleRate = mOutput->stream->common.get_sample_rate(&mOutput->stream->common);
+    mChannelMask = mOutput->stream->common.get_channels(&mOutput->stream->common);
+    mChannelCount = (uint16_t)popcount(mChannelMask);
+    mFormat = mOutput->stream->common.get_format(&mOutput->stream->common);
+    mFrameSize = (uint16_t)audio_stream_frame_size(&mOutput->stream->common);
+    mInputBytes = mOutput->stream->common.get_buffer_size(&mOutput->stream->common);
+    mFrameCount = mInputBytes / mFrameSize;
+    mRsmpInBuffer = new int16_t[mFrameCount * mChannelCount];
+
+    mOutputDupSize = 0;
+    mOutputDupBytes = mInputBytes * 2; // allocates enough room to buffer twice what is sent to the hardware
+    mOutputDupReadIndex = 0;
+    mOutputDupWriteIndex = 0;
+    mOutputDupBuffer = new uint8_t[mOutputDupBytes];
+
+    LOGW("**MixRecordThread** ::readInputParam sampleRate %d (req=%d), channelCount %d (req=%d), frameSize %d, bufferSize %d",
+     mSampleRate, mReqSampleRate, mChannelCount, mReqChannelCount, mFrameSize, mInputBytes);
+
+    if (mSampleRate != mReqSampleRate && mChannelCount < 3 && mReqChannelCount < 3)
+    {
+        int channelCount;
+         // optmization: if mono to mono, use the resampler in stereo to stereo mode to avoid
+         // stereo to mono post process as the resampler always outputs stereo.
+        if (mChannelCount == 1 && mReqChannelCount == 2) {
+            channelCount = 1;
+        } else {
+            channelCount = 2;
+        }
+        LOGW("MixRecordThread::readInputParam Creating RESAMPLER");
+        speex_resampler_itfe* provider = new speex_resampler_itfe();
+        provider->provider_itfe.get_next_buffer = speex_resampler_itfe_get_next_buffer;
+        provider->provider_itfe.release_buffer = speex_resampler_itfe_releaese_buffer;
+        provider->audio_itfe = this;
+        mBufferProvider = provider;
+        create_resampler(mSampleRate, mReqSampleRate, mChannelCount, RESAMPLER_QUALITY_DESKTOP, (resampler_buffer_provider*) provider, (resampler_itfe**)&mResampler);
+        if(mResampler == 0) {
+            LOGV("MixRecordThread::readInputParam FAILED Creating RESAMPLER");
+        }
+        //mResampler = AudioResampler::create(16, channelCount, mReqSampleRate);
+        //mResampler->setSampleRate(mSampleRate);
+        //mResampler->setVolume(AudioMixer::UNITY_GAIN, AudioMixer::UNITY_GAIN);
+        mRsmpOutBuffer = new int32_t[mFrameCount * 2];
+
+        // optmization: if mono to mono, alter input frame count as if we were inputing stereo samples
+        if (mChannelCount == 1 && mReqChannelCount == 1) {
+            mFrameCount >>= 1;
+        }
+
+    }
+    mRsmpInIndex = mFrameCount;
+}
+
+// unsigned int AudioFlinger::MixRecordThread::getInputFramesLost()
+// {
+//     Mutex::Autolock _l(mLock);
+//     if (initCheck() != NO_ERROR) {
+//         return 0;
+//     }
+
+//     return mInput->stream->get_input_frames_lost(mInput->stream);
+// }
+
+uint32_t AudioFlinger::MixRecordThread::hasAudioSession(int sessionId)
+{
+    Mutex::Autolock _l(mLock);
+    uint32_t result = 0;
+    // if (getEffectChain_l(sessionId) != 0) {
+    //     result = EFFECT_SESSION;
+    // }
+
+    if (mTrack != NULL && sessionId == mTrack->sessionId()) {
+        result |= TRACK_SESSION;
+    }
+
+    return result;
+}
+
+AudioFlinger::MixRecordThread::RecordTrack* AudioFlinger::MixRecordThread::track()
+{
+    Mutex::Autolock _l(mLock);
+    return mTrack;
+}
+
+// AudioFlinger::AudioStreamIn* AudioFlinger::MixRecordThread::getInput()
+// {
+//     Mutex::Autolock _l(mLock);
+//     return mInput;
+// }
+
+// AudioFlinger::AudioStreamIn* AudioFlinger::MixRecordThread::clearInput()
+// {
+//     Mutex::Autolock _l(mLock);
+//     AudioStreamIn *input = mInput;
+//     mInput = NULL;
+//     return input;
+// }
+
+//this method must always be called either with ThreadBase mLock held or inside the thread loop
+audio_stream_t* AudioFlinger::MixRecordThread::stream()
+{
+    Mutex::Autolock _l(mLock);
+    MixerThread *thread = mAudioFlinger->primaryMixerThread_l();
+    return thread->stream();
+}
 
 // ----------------------------------------------------------------------------
 
@@ -4957,6 +5985,15 @@ int AudioFlinger::openOutput(uint32_t *pDevices,
         }
         mPlaybackThreads.add(id, thread);
 
+        if (output->hwDev == mPrimaryHardwareDev && mMixRecordThread == 0) {
+          MixRecordThread *mixRecThread = NULL;
+          int idMixRec = nextUniqueId();
+          mixRecThread = new MixRecordThread(this, 48000, channels,
+                idMixRec, *pDevices);
+            mMixRecordThread = mixRecThread;
+            LOGW("openOutput() created MixRecordThread: ID %d thread %p", idMixRec, mixRecThread);
+        }
+
         if (pSamplingRate) *pSamplingRate = samplingRate;
         if (pFormat) *pFormat = format;
         if (pChannels) *pChannels = channels;
@@ -5000,6 +6037,15 @@ status_t AudioFlinger::closeOutput(int output)
         thread = checkPlaybackThread_l(output);
         if (thread == NULL) {
             return BAD_VALUE;
+        }
+
+        AudioStreamOut *outputss = thread->getOutput();
+        if (outputss != NULL && outputss->hwDev == mPrimaryHardwareDev) {
+            MixRecordThread *mixRecThread = checkMixRecordThread_l();
+            if (mixRecThread != NULL) {
+                mixRecThread->exit();
+            }
+            LOGV("closeOutput() closed MixRecordThread");
         }
 
         LOGV("closeOutput() %d", output);
@@ -5331,6 +6377,19 @@ AudioFlinger::MixerThread *AudioFlinger::checkMixerThread_l(int output) const
     return (MixerThread *)thread;
 }
 
+// primaryMixerThread_l() must be called with AudioFlinger::mLock held
+AudioFlinger::MixerThread *AudioFlinger::primaryMixerThread_l()
+{
+    for (size_t i = 0; i < mPlaybackThreads.size(); i++) {
+        PlaybackThread *thread = mPlaybackThreads.valueAt(i).get();
+        AudioStreamOut *output = thread->getOutput();
+        if (output != NULL && output->hwDev == mPrimaryHardwareDev) {
+            return (MixerThread *)thread;
+        }
+    }
+    return NULL;
+}
+
 // checkRecordThread_l() must be called with AudioFlinger::mLock held
 AudioFlinger::RecordThread *AudioFlinger::checkRecordThread_l(int input) const
 {
@@ -5338,6 +6397,14 @@ AudioFlinger::RecordThread *AudioFlinger::checkRecordThread_l(int input) const
     if (mRecordThreads.indexOfKey(input) >= 0) {
         thread = (RecordThread *)mRecordThreads.valueFor(input).get();
     }
+    return thread;
+}
+
+// checkMixRecordThread_l() must be called with AudioFlinger::mLock held
+AudioFlinger::MixRecordThread *AudioFlinger::checkMixRecordThread_l() const
+{
+    MixRecordThread *thread = NULL;
+    thread = (MixRecordThread *) mMixRecordThread.get();
     return thread;
 }
 
@@ -6074,6 +7141,36 @@ status_t AudioFlinger::RecordThread::addEffectChain_l(const sp<EffectChain>& cha
 }
 
 size_t AudioFlinger::RecordThread::removeEffectChain_l(const sp<EffectChain>& chain)
+{
+    LOGV("removeEffectChain_l() %p from thread %p", chain.get(), this);
+    LOGW_IF(mEffectChains.size() != 1,
+            "removeEffectChain_l() %p invalid chain size %d on thread %p",
+            chain.get(), mEffectChains.size(), this);
+    if (mEffectChains.size() == 1) {
+        mEffectChains.removeAt(0);
+    }
+    return 0;
+}
+
+status_t AudioFlinger::MixRecordThread::addEffectChain_l(const sp<EffectChain>& chain)
+{
+    // only one chain per input thread
+    if (mEffectChains.size() != 0) {
+        return INVALID_OPERATION;
+    }
+    LOGV("addEffectChain_l() %p on thread %p", chain.get(), this);
+
+    chain->setInBuffer(NULL);
+    chain->setOutBuffer(NULL);
+
+    checkSuspendOnAddEffectChain_l(chain);
+
+    mEffectChains.add(chain);
+
+    return NO_ERROR;
+}
+
+size_t AudioFlinger::MixRecordThread::removeEffectChain_l(const sp<EffectChain>& chain)
 {
     LOGV("removeEffectChain_l() %p from thread %p", chain.get(), this);
     LOGW_IF(mEffectChains.size() != 1,

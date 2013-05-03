@@ -10458,6 +10458,42 @@ package android.media {
     method public abstract void onAudioFocusChange(int);
   }
 
+  public class AudioMixRecord {
+    ctor public AudioMixRecord(int, int, int, int) throws java.lang.IllegalArgumentException;
+    method public int getAudioFormat();
+    method public int getChannelConfiguration();
+    method public int getChannelCount();
+    method public static int getMinBufferSize(int, int, int);
+    method public int getNotificationMarkerPosition();
+    method public int getPositionNotificationPeriod();
+    method public int getRecordingState();
+    method public int getSampleRate();
+    method public int getState();
+    method public int read(byte[], int, int);
+    method public int read(short[], int, int);
+    method public int read(java.nio.ByteBuffer, int);
+    method public void release();
+    method public int setNotificationMarkerPosition(int);
+    method public int setPositionNotificationPeriod(int);
+    method public void setRecordPositionUpdateListener(android.media.AudioMixRecord.OnRecordPositionUpdateListener);
+    method public void setRecordPositionUpdateListener(android.media.AudioMixRecord.OnRecordPositionUpdateListener, android.os.Handler);
+    method public void startRecording() throws java.lang.IllegalStateException;
+    method public void stop() throws java.lang.IllegalStateException;
+    field public static final int ERROR = -1; // 0xffffffff
+    field public static final int ERROR_BAD_VALUE = -2; // 0xfffffffe
+    field public static final int ERROR_INVALID_OPERATION = -3; // 0xfffffffd
+    field public static final int RECORDSTATE_RECORDING = 3; // 0x3
+    field public static final int RECORDSTATE_STOPPED = 1; // 0x1
+    field public static final int STATE_INITIALIZED = 1; // 0x1
+    field public static final int STATE_UNINITIALIZED = 0; // 0x0
+    field public static final int SUCCESS = 0; // 0x0
+  }
+
+  public static abstract interface AudioMixRecord.OnRecordPositionUpdateListener {
+    method public abstract void onMarkerReached(android.media.AudioMixRecord);
+    method public abstract void onPeriodicNotification(android.media.AudioMixRecord);
+  }
+
   public class AudioRecord {
     ctor public AudioRecord(int, int, int, int, int) throws java.lang.IllegalArgumentException;
     method public int getAudioFormat();

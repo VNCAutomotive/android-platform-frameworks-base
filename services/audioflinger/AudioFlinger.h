@@ -201,6 +201,16 @@ public:
                                 uint32_t flags,
                                 int *sessionId,
                                 status_t *status);
+    // audio mix record interface
+    virtual sp<IAudioRecord> openMixRecord(
+                                pid_t pid,
+                                uint32_t sampleRate,
+                                uint32_t format,
+                                uint32_t channelMask,
+                                int frameCount,
+                                uint32_t flags,
+                                int *sessionId,
+                                status_t *status);
 
     virtual     status_t    onTransact(
                                 uint32_t code,
@@ -268,6 +278,7 @@ private:
     class TrackHandle;
     class RecordHandle;
     class RecordThread;
+    class MixRecordThread;
     class PlaybackThread;
     class MixerThread;
     class DirectOutputThread;
@@ -340,6 +351,7 @@ private:
             friend class RecordHandle;
             friend class PlaybackThread;
             friend class RecordThread;
+            friend class MixRecordThread;
             friend class MixerThread;
             friend class DirectOutputThread;
 
@@ -533,6 +545,7 @@ private:
         friend class DirectOutputThread;
         friend class DuplicatingThread;
         friend class RecordThread;
+        friend class MixRecordThread;
         friend class RecordTrack;
 
                     int                     mType;
@@ -769,6 +782,7 @@ private:
 
     protected:
         int16_t*                        mMixBuffer;
+        int16_t*                        mSilenceBuffer;
         int                             mSuspended;
         int                             mBytesWritten;
         bool                            mMasterMute;
@@ -787,6 +801,7 @@ private:
         friend class Track;
         friend class TrackBase;
         friend class MixerThread;
+        friend class MixRecordThread;
         friend class DirectOutputThread;
         friend class DuplicatingThread;
 
@@ -892,6 +907,8 @@ private:
               PlaybackThread *checkPlaybackThread_l(int output) const;
               MixerThread *checkMixerThread_l(int output) const;
               RecordThread *checkRecordThread_l(int input) const;
+              MixRecordThread *checkMixRecordThread_l() const;
+              MixerThread *primaryMixerThread_l();
               float streamVolumeInternal(int stream) const { return mStreamTypes[stream].volume; }
               void audioConfigChanged_l(int event, int ioHandle, void *param2);
 
@@ -1041,6 +1058,128 @@ private:
     private:
         sp<RecordThread::RecordTrack> mRecordTrack;
     };
+
+    // ----------------------------------------------------------------------------------------
+    // audio mix record thread
+    class MixRecordThread : public ThreadBase, public AudioBufferProvider
+    {
+    public:
+
+        // record track
+        class RecordTrack : public TrackBase {
+        public:
+                                RecordTrack(const wp<ThreadBase>& thread,
+                                        const sp<Client>& client,
+                                        uint32_t sampleRate,
+                                        uint32_t format,
+                                        uint32_t channelMask,
+                                        int frameCount,
+                                        uint32_t flags,
+                                        int sessionId);
+                                ~RecordTrack();
+
+            virtual status_t    start();
+            virtual void        stop();
+
+                    bool        overflow() { bool tmp = mOverflow; mOverflow = false; return tmp; }
+                    bool        setOverflow() { bool tmp = mOverflow; mOverflow = true; return tmp; }
+
+                    void        dump(char* buffer, size_t size);
+
+        private:
+            friend class AudioFlinger;
+            friend class MixRecordThread;
+
+                                RecordTrack(const RecordTrack&);
+                                RecordTrack& operator = (const RecordTrack&);
+
+            virtual status_t getNextBuffer(AudioBufferProvider::Buffer* buffer);
+
+            bool                mOverflow;
+        };
+
+
+                MixRecordThread(const sp<AudioFlinger>& audioFlinger,
+                        uint32_t sampleRate,
+                        uint32_t channels,
+                        int id,
+                        uint32_t device);
+                ~MixRecordThread();
+
+        virtual bool        threadLoop();
+        virtual status_t    readyToRun();
+        virtual void        onFirstRef();
+
+        virtual status_t    initCheck() const { return NO_ERROR; }
+                sp<AudioFlinger::MixRecordThread::RecordTrack>  createRecordTrack_l(
+                        const sp<AudioFlinger::Client>& client,
+                        uint32_t sampleRate,
+                        int format,
+                        int channelMask,
+                        int frameCount,
+                        uint32_t flags,
+                        int sessionId,
+                        status_t *status);
+
+                status_t    start(RecordTrack* recordTrack);
+                void        stop(RecordTrack* recordTrack);
+                status_t    dump(int fd, const Vector<String16>& args);
+                //AudioStreamIn* getInput();
+                //AudioStreamIn* clearInput();
+                virtual audio_stream_t* stream();
+
+        virtual status_t    getNextBuffer(AudioBufferProvider::Buffer* buffer);
+        virtual void        releaseBuffer(AudioBufferProvider::Buffer* buffer);
+        virtual bool        checkForNewParameters_l();
+        virtual String8     getParameters(const String8& keys);
+        virtual void        audioConfigChanged_l(int event, int param = 0);
+                void        readInputParameters();
+        //virtual unsigned int  getInputFramesLost();
+
+        virtual status_t addEffectChain_l(const sp<EffectChain>& chain);
+        virtual size_t removeEffectChain_l(const sp<EffectChain>& chain);
+        virtual uint32_t hasAudioSession(int sessionId);
+                RecordTrack* track();
+        virtual void bytesSentToHardware(void* data, size_t size);
+        virtual ssize_t readBytesSentToHardware(void* dst, size_t size);
+        virtual bool isRecording() { return mRecording; }
+    private:
+                MixRecordThread();
+                RecordTrack*                        mTrack;
+                sp<RecordTrack>                     mActiveTrack;
+                Condition                           mStartStopCond;
+                void                                *mResampler;
+                void                                *mBufferProvider;
+                int32_t                             *mRsmpOutBuffer;
+                int16_t                             *mRsmpInBuffer;
+                size_t                              mRsmpInIndex;
+                size_t                              mInputBytes;
+                int                                 mReqChannelCount;
+                uint32_t                            mReqSampleRate;
+                ssize_t                             mBytesRead;
+                uint8_t*                            mOutputDupBuffer;
+                size_t                              mOutputDupReadIndex;
+                size_t                              mOutputDupWriteIndex;
+                volatile size_t                     mOutputDupSize;
+                size_t                              mOutputDupBytes;
+                mutable     Mutex                   mOutputDupLock;
+                bool                                mRecording;
+    };
+    friend struct speex_resampler_itfe;
+
+    class MixRecordHandle : public android::BnAudioRecord {
+    public:
+        MixRecordHandle(const sp<MixRecordThread::RecordTrack>& recordTrack);
+        virtual             ~MixRecordHandle();
+        virtual status_t    start();
+        virtual void        stop();
+        virtual sp<IMemory> getCblk() const;
+        virtual status_t onTransact(
+            uint32_t code, const Parcel& data, Parcel* reply, uint32_t flags);
+    private:
+        sp<MixRecordThread::RecordTrack> mRecordTrack;
+    };
+    // ----------------------------------------------------------------------------------------
 
     //--- Audio Effect Management
 
@@ -1382,6 +1521,7 @@ private:
     };
 
     friend class RecordThread;
+    friend class MixRecordThread;
     friend class PlaybackThread;
 
     mutable     Mutex                               mLock;
@@ -1400,6 +1540,7 @@ private:
                 bool                                mMasterMute;
 
                 DefaultKeyedVector< int, sp<RecordThread> >    mRecordThreads;
+                sp<MixRecordThread> mMixRecordThread;
 
                 DefaultKeyedVector< pid_t, sp<NotificationClient> >    mNotificationClients;
                 volatile int32_t                    mNextUniqueId;

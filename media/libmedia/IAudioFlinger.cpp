@@ -31,6 +31,7 @@ namespace android {
 enum {
     CREATE_TRACK = IBinder::FIRST_CALL_TRANSACTION,
     OPEN_RECORD,
+    OPEN_MIX_RECORD,
     SAMPLE_RATE,
     CHANNEL_COUNT,
     FORMAT,
@@ -156,6 +157,47 @@ public:
         status_t lStatus = remote()->transact(OPEN_RECORD, data, &reply);
         if (lStatus != NO_ERROR) {
             LOGE("openRecord error: %s", strerror(-lStatus));
+        } else {
+            lSessionId = reply.readInt32();
+            if (sessionId != NULL) {
+                *sessionId = lSessionId;
+            }
+            lStatus = reply.readInt32();
+            record = interface_cast<IAudioRecord>(reply.readStrongBinder());
+        }
+        if (status) {
+            *status = lStatus;
+        }
+        return record;
+    }
+
+    virtual sp<IAudioRecord> openMixRecord(
+                                pid_t pid,
+                                uint32_t sampleRate,
+                                uint32_t format,
+                                uint32_t channelMask,
+                                int frameCount,
+                                uint32_t flags,
+                                int *sessionId,
+                                status_t *status)
+    {
+        Parcel data, reply;
+        sp<IAudioRecord> record;
+        data.writeInterfaceToken(IAudioFlinger::getInterfaceDescriptor());
+        data.writeInt32(pid);
+        data.writeInt32(sampleRate);
+        data.writeInt32(format);
+        data.writeInt32(channelMask);
+        data.writeInt32(frameCount);
+        data.writeInt32(flags);
+        int lSessionId = 0;
+        if (sessionId != NULL) {
+            lSessionId = *sessionId;
+        }
+        data.writeInt32(lSessionId);
+        status_t lStatus = remote()->transact(OPEN_MIX_RECORD, data, &reply);
+        if (lStatus != NO_ERROR) {
+            LOGE("openMixRecord error: %s", strerror(-lStatus));
         } else {
             lSessionId = reply.readInt32();
             if (sessionId != NULL) {
@@ -706,6 +748,23 @@ status_t BnAudioFlinger::onTransact(
             int sessionId = data.readInt32();
             status_t status;
             sp<IAudioRecord> record = openRecord(pid, input,
+                    sampleRate, format, channelCount, bufferCount, flags, &sessionId, &status);
+            reply->writeInt32(sessionId);
+            reply->writeInt32(status);
+            reply->writeStrongBinder(record->asBinder());
+            return NO_ERROR;
+        } break;
+        case OPEN_MIX_RECORD: {
+            CHECK_INTERFACE(IAudioFlinger, data, reply);
+            pid_t pid = data.readInt32();
+            uint32_t sampleRate = data.readInt32();
+            int format = data.readInt32();
+            int channelCount = data.readInt32();
+            size_t bufferCount = data.readInt32();
+            uint32_t flags = data.readInt32();
+            int sessionId = data.readInt32();
+            status_t status;
+            sp<IAudioRecord> record = openMixRecord(pid,
                     sampleRate, format, channelCount, bufferCount, flags, &sessionId, &status);
             reply->writeInt32(sessionId);
             reply->writeInt32(status);

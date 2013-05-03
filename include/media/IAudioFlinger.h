@@ -68,6 +68,16 @@ public:
                                 int *sessionId,
                                 status_t *status) = 0;
 
+    virtual sp<IAudioRecord> openMixRecord(
+                                pid_t pid,
+                                uint32_t sampleRate,
+                                uint32_t format,
+                                uint32_t channelMask,
+                                int frameCount,
+                                uint32_t flags,
+                                int *sessionId,
+                                status_t *status) = 0;
+
     /* query the audio hardware state. This state never changes,
      * and therefore can be cached.
      */

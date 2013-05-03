@@ -81,6 +81,7 @@ extern int register_android_hardware_UsbDeviceConnection(JNIEnv *env);
 extern int register_android_hardware_UsbRequest(JNIEnv *env);
 
 extern int register_android_media_AudioRecord(JNIEnv *env);
+extern int register_android_media_AudioMixRecord(JNIEnv *env);
 extern int register_android_media_AudioSystem(JNIEnv *env);
 extern int register_android_media_AudioTrack(JNIEnv *env);
 extern int register_android_media_JetPlayer(JNIEnv *env);
@@ -1169,6 +1170,7 @@ static const RegJNIRec gRegJNI[] = {
     REG_JNI(register_android_hardware_UsbDeviceConnection),
     REG_JNI(register_android_hardware_UsbRequest),
     REG_JNI(register_android_media_AudioRecord),
+    REG_JNI(register_android_media_AudioMixRecord),
     REG_JNI(register_android_media_AudioSystem),
     REG_JNI(register_android_media_AudioTrack),
     REG_JNI(register_android_media_JetPlayer),
