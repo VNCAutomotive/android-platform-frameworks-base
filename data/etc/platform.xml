@@ -85,6 +85,14 @@
         <group gid="net_admin" />
     </permission>
 
+    <permission name="android.permission.NET_BIND_SERVICE" >
+        <group gid="net_bind_service" />
+    </permission>
+
+    <permission name="android.permission.NET_RAW" >
+        <group gid="net_raw" />
+    </permission>
+
     <!-- The group that /cache belongs to, linked to the permission
          set on the applications that can access /cache -->
     <permission name="android.permission.ACCESS_CACHE_FILESYSTEM" >

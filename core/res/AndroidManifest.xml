@@ -1086,6 +1086,18 @@
         android:permissionGroup="android.permission-group.SYSTEM_TOOLS"
         android:protectionLevel="signature" />
 
+    <!-- Allows access to bind to system ports (under 1024)
+         @hide -->
+    <permission android:name="android.permission.NET_BIND_SERVICE"
+        android:permissionGroup="android.permission-group.SYSTEM_TOOLS"
+        android:protectionLevel="signature" />
+
+    <!-- Allows access to use raw sockets
+         @hide -->
+    <permission android:name="android.permission.NET_RAW"
+        android:permissionGroup="android.permission-group.SYSTEM_TOOLS"
+        android:protectionLevel="signature" />
+
     <!-- Allows registration for remote audio playback. @hide -->
     <permission android:name="android.permission.REMOTE_AUDIO_PLAYBACK"
         android:permissionGroup="android.permission-group.SYSTEM_TOOLS"
