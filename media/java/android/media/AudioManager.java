@@ -723,6 +723,30 @@ public class AudioManager {
         }
     }
 
+    /** @hide
+     *  Prevents adjusting the volume (no setting)
+     */
+    public void lockVolumeAdjust() {
+        IAudioService service = getService();
+        try {
+            service.lockVolumeAdjust();
+        } catch (RemoteException e) {
+            Log.e(TAG, "Dead object in lockVolumeAdjust", e);
+        }
+    }
+
+    /** @hide
+     *  Enables adjusting the volume (no setting)
+     */
+    public void unlockVolumeAdjust() {
+        IAudioService service = getService();
+        try {
+            service.unlockVolumeAdjust();
+        } catch (RemoteException e) {
+            Log.e(TAG, "Dead object in unlockVolumeAdjust", e);
+        }
+    }
+
     /**
      * Indicates if the device implements a fixed volume policy.
      * <p>Some devices may not have volume control and may operate at a fixed volume,
