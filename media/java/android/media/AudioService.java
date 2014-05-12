@@ -62,6 +62,7 @@ import android.os.RemoteCallbackList;
 import android.os.RemoteException;
 import android.os.ServiceManager;
 import android.os.SystemProperties;
+import android.os.SystemClock;
 import android.os.UserHandle;
 import android.os.Vibrator;
 import android.provider.Settings;
@@ -191,6 +192,9 @@ public class AudioService extends IAudioService.Stub {
 
     // Maximum volume adjust steps allowed in a single batch call.
     private static final int MAX_BATCH_VOLUME_ADJUST_STEPS = 4;
+
+    /* Implemented MirrorLink VolumeAdjustLock */
+    private long mVolumeAdjustLockTimeout = 0;
 
     /* Sound effect file names  */
     private static final String SOUND_EFFECTS_PATH = "/media/audio/ui/";
@@ -748,6 +752,17 @@ public class AudioService extends IAudioService.Stub {
         return (index * mStreamStates[dstStream].getMaxIndex() + mStreamStates[srcStream].getMaxIndex() / 2) / mStreamStates[srcStream].getMaxIndex();
     }
 
+    /**
+     * @hide
+     */
+    private boolean volumeAdjustLocked() {
+        long timeOut = SystemClock.uptimeMillis();
+        boolean lock = (mVolumeAdjustLockTimeout + 1000 > timeOut);
+        Log.i(TAG, "Volume adjust is meant to be " + (lock ? "locked" : "unlocked"));
+        return lock;
+    }
+
+
     ///////////////////////////////////////////////////////////////////////////
     // IPC methods
     ///////////////////////////////////////////////////////////////////////////
@@ -771,6 +786,21 @@ public class AudioService extends IAudioService.Stub {
         if (DEBUG_VOL) Log.d(TAG, "isLocalOrRemoteMusicActive(): no");
         return false;
     }
+
+    /** @see AudioManager#lockVolumeAdjust()
+     * @hide
+     */
+    public void lockVolumeAdjust() {
+        mVolumeAdjustLockTimeout = SystemClock.uptimeMillis();
+    }
+
+    /** @see AudioManager#unlockVolumeAdjust()
+     * @hide
+     */
+    public void unlockVolumeAdjust() {
+        mVolumeAdjustLockTimeout = 0;
+    }
+
 
     /** @see AudioManager#adjustVolume(int, int) */
     public void adjustVolume(int direction, int flags, String callingPackage) {
@@ -829,6 +859,9 @@ public class AudioService extends IAudioService.Stub {
 
         ensureValidDirection(direction);
         ensureValidStreamType(streamType);
+
+        if(volumeAdjustLocked())
+            return;
 
         // use stream type alias here so that streams with same alias have the same behavior,
         // including with regard to silent mode control (e.g the use of STREAM_RING below and in

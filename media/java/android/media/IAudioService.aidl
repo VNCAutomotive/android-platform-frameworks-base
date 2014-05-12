@@ -35,6 +35,10 @@ import android.view.KeyEvent;
  */
 interface IAudioService {
 
+    void lockVolumeAdjust();
+
+    void unlockVolumeAdjust();
+
     void adjustVolume(int direction, int flags, String callingPackage);
 
     boolean isLocalOrRemoteMusicActive();
