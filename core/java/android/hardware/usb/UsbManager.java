@@ -60,6 +60,8 @@ public class UsbManager {
      * adb function is enabled
      * <li> {@link #USB_FUNCTION_RNDIS} boolean extra indicating whether the
      * RNDIS ethernet function is enabled
+     * <li> {@link #USB_FUNCTION_NCM} boolean extra indicating whether the
+     * NCM ethernet function is enabled
      * <li> {@link #USB_FUNCTION_MTP} boolean extra indicating whether the
      * MTP function is enabled
      * <li> {@link #USB_FUNCTION_PTP} boolean extra indicating whether the
@@ -138,6 +140,14 @@ public class UsbManager {
     public static final String USB_CONFIGURED = "configured";
 
     /**
+     * Boolean extra indicating whether NCM is required.
+     * Used in extras for the {@link #ACTION_USB_STATE} broadcast.
+     *
+     * {@hide}
+     */
+    public static final String NCM_REQUESTED = "ncm_requested";
+
+    /**
      * Name of the USB mass storage USB function.
      * Used in extras for the {@link #ACTION_USB_STATE} broadcast
      *
@@ -184,6 +194,14 @@ public class UsbManager {
      * {@hide}
      */
     public static final String USB_FUNCTION_ACCESSORY = "accessory";
+
+    /**
+     * Name of the NCM USB function.
+     * Used in extras for the {@link #ACTION_USB_STATE} broadcast
+     *
+     * {@hide}
+     */
+    public static final String USB_FUNCTION_NCM = "ncm";
 
     /**
      * Name of extra for {@link #ACTION_USB_DEVICE_ATTACHED} and
