@@ -81,7 +81,7 @@ public class UsbDeviceManager {
     private static final String RNDIS_ETH_ADDR_PATH =
             "/sys/class/android_usb/android0/f_rndis/ethaddr";
     private static final String NCM_ETH_ADDR_PATH =
-            "/sys/class/android_usb/android0/f_ncm/ethaddr";
+            "/sys/class/android_usb/android0/f_ncm/ncm_ethaddr";
     private static final String AUDIO_SOURCE_PCM_PATH =
             "/sys/class/android_usb/android0/f_audio_source/pcm";
 
