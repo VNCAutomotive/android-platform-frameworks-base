@@ -96,6 +96,8 @@ public class UsbDeviceManager {
             "/sys/class/android_usb/android0/state";
     private static final String RNDIS_ETH_ADDR_PATH =
             "/sys/class/android_usb/android0/f_rndis/ethaddr";
+    private static final String NCM_ETH_ADDR_PATH =
+            "/sys/class/android_usb/android0/f_ncm/ncm_ethaddr";
     private static final String AUDIO_SOURCE_PCM_PATH =
             "/sys/class/android_usb/android0/f_audio_source/pcm";
     private static final String MIDI_ALSA_PATH =
@@ -196,6 +198,7 @@ public class UsbDeviceManager {
         PackageManager pm = mContext.getPackageManager();
         mHasUsbAccessory = pm.hasSystemFeature(PackageManager.FEATURE_USB_ACCESSORY);
         initRndisAddress();
+        initNcmAddress();
 
         readOemUsbOverrideConfig();
 
@@ -311,6 +314,29 @@ public class UsbDeviceManager {
         }
     }
 
+    private static void initNcmAddress() {
+        // configure NCM ethernet address based on our serial number using the same algorithm
+        // we had been previously using in kernel board files
+        final int ETH_ALEN = 6;
+        int address[] = new int[ETH_ALEN];
+        // first byte is 0x02 to signify a locally administered address
+        address[0] = 0x02;
+
+        String serial = SystemProperties.get("ro.serialno", "1234567890ABCDEF");
+        int serialLength = serial.length();
+        // XOR the USB serial across the remaining 5 bytes
+        for (int i = 0; i < serialLength; i++) {
+            address[i % (ETH_ALEN - 1) + 1] ^= (int)serial.charAt(i);
+        }
+        String addrString = String.format(Locale.US, "%02X:%02X:%02X:%02X:%02X:%02X",
+            address[0], address[1], address[2], address[3], address[4], address[5]);
+        try {
+            FileUtils.stringToFile(NCM_ETH_ADDR_PATH, addrString);
+        } catch (IOException e) {
+           Slog.e(TAG, "failed to write to " + NCM_ETH_ADDR_PATH);
+        }
+    }
+
     private final class UsbHandler extends Handler {
 
         // current USB state
@@ -318,6 +344,7 @@ public class UsbDeviceManager {
         private boolean mHostConnected;
         private boolean mConfigured;
         private boolean mUsbDataUnlocked;
+        private boolean mNcmRequested;
         private String mCurrentFunctions;
         private boolean mCurrentFunctionsApplied;
         private UsbAccessory mCurrentAccessory;
@@ -382,6 +409,9 @@ public class UsbDeviceManager {
             } else if ("CONFIGURED".equals(state)) {
                 connected = 1;
                 configured = 1;
+            } else if ("NCM".equals(state)) {
+                connected = 1;
+                configured = 2;
             } else {
                 Slog.e(TAG, "unknown state " + state);
                 return;
@@ -580,6 +610,7 @@ public class UsbDeviceManager {
                     | Intent.FLAG_RECEIVER_FOREGROUND);
             intent.putExtra(UsbManager.USB_CONNECTED, mConnected);
             intent.putExtra(UsbManager.USB_CONFIGURED, mConfigured);
+            intent.putExtra(UsbManager.NCM_REQUESTED, mNcmRequested);
             intent.putExtra(UsbManager.USB_DATA_UNLOCKED, isUsbTransferAllowed() && mUsbDataUnlocked);
 
             if (mCurrentFunctions != null) {
@@ -654,7 +685,8 @@ public class UsbDeviceManager {
             switch (msg.what) {
                 case MSG_UPDATE_STATE:
                     mConnected = (msg.arg1 == 1);
-                    mConfigured = (msg.arg2 == 1);
+                    mConfigured = (msg.arg2 >= 1);
+                    mNcmRequested = (msg.arg2 == 2) && mConnected;
                     if (!mConnected) {
                         // When a disconnect occurs, relock access to sensitive user data
                         mUsbDataUnlocked = false;

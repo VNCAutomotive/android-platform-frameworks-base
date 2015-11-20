@@ -59,6 +59,8 @@ public class UsbManager {
      * adb function is enabled
      * <li> {@link #USB_FUNCTION_RNDIS} boolean extra indicating whether the
      * RNDIS ethernet function is enabled
+     * <li> {@link #USB_FUNCTION_NCM} boolean extra indicating whether the
+     *  ethernet function is enabled
      * <li> {@link #USB_FUNCTION_MTP} boolean extra indicating whether the
      * MTP function is enabled
      * <li> {@link #USB_FUNCTION_PTP} boolean extra indicating whether the
@@ -167,6 +169,14 @@ public class UsbManager {
     public static final String USB_DATA_UNLOCKED = "unlocked";
 
     /**
+     * Boolean extra indicating whether NCM is required.
+     * Used in extras for the {@link #ACTION_USB_STATE} broadcast.
+     *
+     * {@hide}
+     */
+    public static final String NCM_REQUESTED = "ncm_requested";
+
+    /**
      * A placeholder indicating that no USB function is being specified.
      * Used to distinguish between selecting no function vs. the default function in
      * {@link #setCurrentFunction(String)}.
@@ -190,6 +200,14 @@ public class UsbManager {
      * {@hide}
      */
     public static final String USB_FUNCTION_RNDIS = "rndis";
+
+    /**
+     * Name of the NCM ethernet USB function.
+     * Used in extras for the {@link #ACTION_USB_STATE} broadcast
+     *
+     * {@hide}
+     */
+    public static final String USB_FUNCTION_NCM = "ncm";
 
     /**
      * Name of the MTP USB function.
